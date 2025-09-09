@@ -217,7 +217,10 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                         msg_part.text = part.at("text");
                         msg.content_parts.push_back(msg_part);
                     }
-                } else if (!content.is_null()) {
+                } else if (content.is_null()) {
+                    // Handle null content by setting it to empty string
+                    msg.content = "";
+                } else {
                     throw std::runtime_error("Invalid 'content' type: expected string or array, got " + content.dump() + " (ref: https://github.com/ggml-org/llama.cpp/issues/8367)");
                 }
             }
@@ -306,7 +309,7 @@ json common_chat_msgs_to_json_oaicompat(const std::vector<common_chat_msg> & msg
                 }
             }
         } else {
-            jmsg["content"] = json(); // null
+            jmsg["content"] = ""; // empty string instead of null
         }
         if (!msg.reasoning_content.empty()) {
             jmsg["reasoning_content"] = msg.reasoning_content;
@@ -638,6 +641,7 @@ const char * common_chat_format_name(common_chat_format format) {
         case COMMON_CHAT_FORMAT_GPT_OSS: return "GPT-OSS";
         case COMMON_CHAT_FORMAT_SEED_OSS: return "Seed-OSS";
         case COMMON_CHAT_FORMAT_NEMOTRON_V2: return "Nemotron V2";
+        case COMMON_CHAT_FORMAT_GLM_4_5: return "GLM 4.5";
         default:
             throw std::runtime_error("Unknown chat format");
     }
@@ -1738,6 +1742,210 @@ static void common_chat_parse_gpt_oss(common_chat_msg_parser & builder) {
     }
 }
 
+static common_chat_params common_chat_params_init_glm_4_5(const common_chat_template & tmpl, const struct templates_params & inputs) {
+    LOG_INF("%s: initializing GLM-4.5 chat params\n", __func__);
+    common_chat_params data;
+    
+    // Configure template inputs
+    minja::chat_template_inputs tmpl_inputs;
+    tmpl_inputs.messages = inputs.messages;
+    tmpl_inputs.tools = inputs.tools.empty() ? json() : inputs.tools;
+    tmpl_inputs.add_generation_prompt = inputs.add_generation_prompt;
+    tmpl_inputs.extra_context = inputs.extra_context;
+    tmpl_inputs.now = inputs.now; // Use the consistent timestamp from params
+    
+    // Configure template options to disable polyfills and enforce native XML format
+    minja::chat_template_options opts;
+    opts.apply_polyfills = false; // Hard disable all polyfills
+    
+    // The prompt is generated here
+    data.prompt = tmpl.apply(tmpl_inputs, opts);
+    data.format = COMMON_CHAT_FORMAT_GLM_4_5;
+    
+    data.preserved_tokens = {
+        "<|system|>", "<|assistant|>", "<|observation|>",
+        "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", 
+        "<arg_value>", "</arg_value>", "<think>", "</think>",
+        "<tool_response>", "</tool_response>",
+    };
+    
+    // Store tools schema for type-aware parsing later
+    data.tools_schema = inputs.tools;
+    
+    LOG_INF("%s: GLM-4.5 native XML format enforced\n", __func__);
+    return data;
+}
+
+static void common_chat_parse_glm_4_5(common_chat_msg_parser & builder) {
+    
+    auto get_expected_type = [&](const std::string& tool_name, const std::string& param_name) -> std::string {
+        // Access tools schema from builder syntax
+        const auto& tools_schema = builder.syntax().tools_schema;
+        if (tools_schema.is_array()) {
+            for (const auto& tool : tools_schema) {
+                if (tool.contains("function") && tool["function"]["name"] == tool_name) {
+                    auto params = tool["function"]["parameters"];
+                    if (params.contains("properties") && params["properties"].contains(param_name)) {
+                        return params["properties"][param_name].value("type", "string");
+                    }
+                }
+            }
+        }
+        return "string"; // Default fallback
+    };
+
+    auto handle_tool_call_end = [&] (common_chat_msg_parser & builder, auto end_pos) {
+        builder.move_to(end_pos);
+        builder.consume_literal("</tool_call>");
+
+        size_t obs_pos = builder.input().find("<|observation|>", builder.pos());
+        if (obs_pos != std::string::npos) {
+            if (obs_pos > builder.pos()) {
+                std::string content = builder.input().substr(builder.pos(), obs_pos - builder.pos());
+                builder.add_content(content);
+            }
+
+            builder.move_to(obs_pos);
+            builder.consume_literal("<|observation|>");
+        } else {
+            std::string remaining = builder.consume_rest();
+            if (!remaining.empty()) builder.add_content(remaining);
+        }
+    };
+
+    builder.consume_spaces();
+    builder.try_parse_reasoning("<think>", "</think>");
+
+    size_t curr_pos = builder.pos();
+    while (builder.input().find("<tool_call>", builder.pos()) != std::string::npos) {
+        size_t tool_call_start = builder.input().find("<tool_call>", builder.pos());
+        if (tool_call_start > builder.pos()) {
+            std::string content = builder.input().substr(builder.pos(), tool_call_start - builder.pos());
+            builder.add_content(content);
+        }
+
+        size_t tool_call_end = builder.input().find("</tool_call>", tool_call_start);
+        if (tool_call_end == std::string::npos) return;
+
+        builder.move_to(tool_call_start);
+        builder.consume_literal("<tool_call>");
+        builder.consume_spaces();
+
+        size_t arg_key_start = builder.input().find("<arg_key>", builder.pos());
+        if (arg_key_start == std::string::npos || arg_key_start > tool_call_end) {
+            std::string function_content = builder.input().substr(builder.pos(), tool_call_end - builder.pos());
+            std::string function_name = string_strip(function_content);
+
+            if (!builder.add_tool_call(function_name, "", "{}")) {
+                LOG_INF("%s: failed to add tool call\n", __func__);
+            }
+            handle_tool_call_end(builder, tool_call_end);
+        } else {
+            std::string function_content = builder.input().substr(builder.pos(), arg_key_start - builder.pos());
+            std::string function_name = string_strip(function_content);
+
+            json args_json = json::object();
+            builder.move_to(arg_key_start);
+
+            while (builder.pos() < tool_call_end && builder.input().substr(builder.pos()).rfind("<arg_key>", 0) == 0) {
+                if (!builder.try_consume_literal("<arg_key>")) break;
+
+                auto key_close = builder.try_find_literal("</arg_key>");
+                if (!key_close || key_close->groups[0].end > tool_call_end) {
+                    throw common_chat_msg_partial_exception("incomplete tool call (arg_key)");
+                }
+                std::string key = string_strip(key_close->prelude);
+
+                builder.consume_spaces();
+                if (!builder.try_consume_literal("<arg_value>")) {
+                     throw common_chat_msg_partial_exception("incomplete tool call (arg_value)");
+                }
+
+                auto value_close = builder.try_find_literal("</arg_value>");
+                if (!value_close || value_close->groups[0].end > tool_call_end) {
+                    throw common_chat_msg_partial_exception("incomplete tool call (arg_value content)");
+                }
+                std::string value = string_strip(value_close->prelude);
+
+                std::string expected_type = get_expected_type(function_name, key);
+                json parsed_value;
+
+                if (expected_type == "integer" || expected_type == "number") {
+                    try {
+                        if (value.find('.') != std::string::npos) {
+                            parsed_value = std::stod(value);
+                        } else {
+                            parsed_value = std::stoll(value);
+                        }
+                    } catch (const std::exception&) {
+                        LOG_WRN("%s: Failed to parse '%s' as a number for key '%s', falling back to string.\n", __func__, value.c_str(), key.c_str());
+                        parsed_value = value;
+                    }
+                } else if (expected_type == "boolean") {
+                    std::string lower_val = value;
+                    std::transform(lower_val.begin(), lower_val.end(), lower_val.begin(),
+                                   [](unsigned char c){ return std::tolower(c); });
+                    if (lower_val == "true" || lower_val == "1") {
+                        parsed_value = true;
+                    } else if (lower_val == "false" || lower_val == "0") {
+                        parsed_value = false;
+                    } else {
+                        LOG_WRN("%s: Ambiguous boolean value '%s' for key '%s', falling back to string.\n", __func__, value.c_str(), key.c_str());
+                        parsed_value = value;
+                    }
+                } else if (expected_type == "array" || expected_type == "object") {
+                    try {
+                        parsed_value = json::parse(value);
+                    } catch (const json::parse_error&) {
+                        LOG_WRN("%s: Failed to parse '%s' as JSON for key '%s', falling back to raw string.\n", __func__, value.c_str(), key.c_str());
+                        parsed_value = value;
+                    }
+                } else {
+                    // Default case is "string".
+                    parsed_value = value;
+                }
+                
+                args_json[key] = parsed_value;
+                builder.consume_spaces();
+            }
+            
+            // This is a special case to handle when the model outputs a single JSON object as a string
+            if (args_json.size() == 1) {
+                const auto key = args_json.begin().key();
+                auto& value = args_json.begin().value();
+                if (value.is_string()) {
+                    try {
+                        json unpacked_json = json::parse(value.get<std::string>());
+                        if (unpacked_json.is_object()) {
+                            args_json = unpacked_json;
+                        }
+                    } catch (const std::exception&) {
+                        // Not a valid JSON string, proceed as normal
+                    }
+                }
+            }
+            
+            if (!builder.add_tool_call(function_name, "", args_json.dump())) {
+                LOG_INF("%s: failed to add tool call with arguments\n", __func__);
+            } else {
+                LOG_INF("%s: successfully added tool call with arguments\n", __func__);
+            }
+            handle_tool_call_end(builder, tool_call_end);
+        }
+
+        if (curr_pos == builder.pos()) {
+            LOG_INF("%s: no progress in parsing, stopping to avoid infinite loop\n", __func__);
+            break;
+        }
+        curr_pos = builder.pos();
+    }
+
+    if (builder.pos() < builder.input().size()) {
+        builder.add_content(builder.consume_rest());
+    }
+}
+
+
 static common_chat_params common_chat_params_init_firefunction_v2(const common_chat_template & tmpl, const struct templates_params & inputs) {
     LOG_DBG("%s\n", __func__);
     common_chat_params data;
@@ -2516,6 +2724,11 @@ static common_chat_params common_chat_templates_apply_jinja(
         return common_chat_params_init_granite(tmpl, params);
     }
 
+    // GLM 4.5: detect by <arg_key> and <arg_value> tags (check before Hermes since both use <tool_call>)
+    if (src.find("[gMASK]<sop>") != std::string::npos && src.find("<arg_key>") != std::string::npos && src.find("<arg_value>") != std::string::npos && params.json_schema.is_null()) {
+        return common_chat_params_init_glm_4_5(tmpl, params);
+    }
+
     // Hermes 2/3 Pro, Qwen 2.5 Instruct (w/ tools)
     if (src.find("<tool_call>") != std::string::npos && params.json_schema.is_null()) {
         return common_chat_params_init_hermes_2_pro(tmpl, params);
@@ -2702,6 +2915,9 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
             break;
         case COMMON_CHAT_FORMAT_NEMOTRON_V2:
             common_chat_parse_nemotron_v2(builder);
+            break;
+        case COMMON_CHAT_FORMAT_GLM_4_5:
+            common_chat_parse_glm_4_5(builder);
             break;
         default:
             throw std::runtime_error(std::string("Unsupported format: ") + common_chat_format_name(builder.syntax().format));

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.h"
+#include <nlohmann/json.hpp>
 #include <functional>
 #include <chrono>
 #include <string>
@@ -114,6 +115,7 @@ enum common_chat_format {
     COMMON_CHAT_FORMAT_GPT_OSS,
     COMMON_CHAT_FORMAT_SEED_OSS,
     COMMON_CHAT_FORMAT_NEMOTRON_V2,
+    COMMON_CHAT_FORMAT_GLM_4_5,
 
     COMMON_CHAT_FORMAT_COUNT, // Not a format, just the # formats
 };
@@ -145,6 +147,7 @@ struct common_chat_params {
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
+    nlohmann::ordered_json              tools_schema = nlohmann::ordered_json();  // Schema for tools to pass to parser
 };
 
 struct common_chat_syntax {
@@ -154,6 +157,7 @@ struct common_chat_syntax {
     bool                     reasoning_in_content  = false;
     bool                     thinking_forced_open  = false;
     bool                     parse_tool_calls      = true;
+    nlohmann::ordered_json   tools_schema          = nlohmann::ordered_json();  // Schema for tools to enable type-aware parsing
 };
 
 // Check if the template supplied via "--chat-template" is supported or not. Returns true if it's valid
