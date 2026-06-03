@@ -2174,9 +2174,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.parallel_tool_calls = inputs.parallel_tool_calls;
 
     if (params.tools.is_array()) {
-        if (params.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && !params.grammar.empty()) {
-            throw std::runtime_error("Cannot specify grammar with tools");
-        }
+        // Note: custom grammar with tools is now supported via pre_trigger_grammar.
+        // The user's grammar is cleared from inputs.grammar in server-common.cpp
+        // and passed separately as pre_trigger_grammar.
         if (caps.supports_tool_calls && !caps.supports_tools) {
             LOG_WRN(
                 "Template supports tool calls but does not natively describe tools. The fallback behaviour used may "

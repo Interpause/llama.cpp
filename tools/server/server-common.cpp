@@ -1047,7 +1047,10 @@ json oaicompat_chat_params_parse(
     inputs.enable_thinking       = opt.enable_thinking;
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
-            throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
+            // Custom grammar with tools: apply as pre-trigger grammar during reasoning,
+            // then yield to tool grammar after reasoning completes.
+            llama_params["pre_trigger_grammar"] = body["grammar"];
+            inputs.grammar = "";  // don't pass user grammar to tool grammar builder
         }
         llama_params["parse_tool_calls"] = true;
     }

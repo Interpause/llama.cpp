@@ -2617,6 +2617,22 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_is_done(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return true;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (!ctx->grammar) {
+        return true;
+    }
+    for (const auto & stack : ctx->grammar->stacks) {
+        if (stack.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // penalties
 
 struct llama_sampler_penalties {

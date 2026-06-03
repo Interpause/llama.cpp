@@ -404,6 +404,7 @@ task_params server_task::params_from_json_cmpl(
             SRV_DBG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(params.sampling.grammar).c_str());
         }
         params.sampling.grammar_lazy = json_value(data, "grammar_lazy", defaults.sampling.grammar_lazy);
+        params.sampling.pre_trigger_grammar = json_value(data, "pre_trigger_grammar", std::string());
         SRV_DBG("Grammar lazy: %s\n", params.sampling.grammar_lazy ? "true" : "false");
     }
 

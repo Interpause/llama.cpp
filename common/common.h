@@ -257,6 +257,7 @@ struct common_params_sampling {
     common_grammar              grammar;      // optional grammar constraint (user / output-format / tool-calls)
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers; // optional triggers (for lazy grammars)
+    std::string                         pre_trigger_grammar; // grammar applied during reasoning (pre-trigger phase)
     std::set<llama_token>               preserved_tokens;
 
     std::vector<llama_logit_bias> logit_bias;     // logit biases to apply

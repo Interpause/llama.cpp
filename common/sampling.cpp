@@ -112,6 +112,10 @@ struct common_sampler {
     common_params_sampling params;
 
     struct llama_sampler * grmr;
+    struct llama_sampler * pre_grmr;  // grammar applied during reasoning (pre-trigger phase)
+    bool                   pre_grmr_done = false;     // set when pre-trigger grammar reaches terminal state
+    std::vector<llama_token> end_reasoning_tokens;    // tokens to force when pre-trigger grammar completes
+    size_t                 end_reasoning_pos = 0;     // position in forced end sequence
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
@@ -260,6 +264,15 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
+    // Pre-trigger grammar: a separate non-lazy grammar applied during reasoning.
+    struct llama_sampler * pre_grmr = nullptr;
+    std::vector<llama_token> end_reasoning_tokens;
+    if (!params.pre_trigger_grammar.empty() && vocab) {
+        pre_grmr = llama_sampler_init_grammar(vocab, params.pre_trigger_grammar.c_str(), "root");
+        // Store end-of-reasoning tokens to force when grammar completes
+        end_reasoning_tokens = params.reasoning_budget_end;
+    }
+
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
     // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
@@ -392,13 +405,17 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params              = */ params,
+        /* .grmr                = */ grmr,
+        /* .pre_grmr            = */ pre_grmr,
+        /* .pre_grmr_done       = */ false,
+        /* .end_reasoning_tokens= */ end_reasoning_tokens,
+        /* .end_reasoning_pos   = */ 0,
+        /* .rbudget             = */ rbudget,
+        /* .chain               = */ chain,
+        /* .prev                = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur                 = */ {},
+        /* .cur_p               = */ {},
     };
 
     return result;
@@ -410,6 +427,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     }
 
     llama_sampler_free(gsmpl->grmr);
+    llama_sampler_free(gsmpl->pre_grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
 
@@ -431,6 +449,17 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+// Check if the pre-trigger grammar should apply (during reasoning phase).
+// Returns false once the grammar reaches a terminal state, allowing the model
+// to generate freely (e.g. emit </think> to end reasoning).
+static bool pre_grammar_should_apply(struct common_sampler * gsmpl) {
+    if (!gsmpl->pre_grmr || !gsmpl->rbudget || gsmpl->pre_grmr_done) {
+        return false;
+    }
+    const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
+    return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_WAITING_UTF8;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar) {
     if (!gsmpl) {
         return;
@@ -439,12 +468,19 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     const auto tm = gsmpl->tm();
 
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
-    accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
+    const bool use_main = accept_grammar && grammar_should_apply(gsmpl);
+    const bool use_pre  = accept_grammar && !use_main && pre_grammar_should_apply(gsmpl);
 
     llama_sampler_accept(gsmpl->rbudget, token);
 
-    if (gsmpl->grmr && accept_grammar) {
+    if (gsmpl->grmr && use_main) {
         llama_sampler_accept(gsmpl->grmr, token);
+    }
+    if (gsmpl->pre_grmr && use_pre) {
+        llama_sampler_accept(gsmpl->pre_grmr, token);
+        if (llama_sampler_grammar_is_done(gsmpl->pre_grmr)) {
+            gsmpl->pre_grmr_done = true;
+        }
     }
 
     llama_sampler_accept(gsmpl->chain, token);
@@ -462,13 +498,17 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params              = */ gsmpl->params,
+        /* .grmr                = */ llama_sampler_clone(gsmpl->grmr),
+        /* .pre_grmr            = */ llama_sampler_clone(gsmpl->pre_grmr),
+        /* .pre_grmr_done       = */ gsmpl->pre_grmr_done,
+        /* .end_reasoning_tokens= */ gsmpl->end_reasoning_tokens,
+        /* .end_reasoning_pos   = */ gsmpl->end_reasoning_pos,
+        /* .rbudget             = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain               = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev                = */ gsmpl->prev,
+        /* .cur                 = */ gsmpl->cur,
+        /* .cur_p               = */ gsmpl->cur_p,
     };
 }
 
@@ -563,24 +603,43 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
-    if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
+    // When pre-trigger grammar has completed, force end-of-reasoning tokens
+    // to ensure the model transitions to content generation immediately.
+    if (gsmpl->pre_grmr_done && gsmpl->end_reasoning_pos < gsmpl->end_reasoning_tokens.size()) {
+        const llama_token forced = gsmpl->end_reasoning_tokens[gsmpl->end_reasoning_pos];
+        for (size_t i = 0; i < cur_p.size; i++) {
+            if (cur_p.data[i].id != forced) {
+                cur_p.data[i].logit = -INFINITY;
+            }
+        }
+        gsmpl->end_reasoning_pos++;
+        llama_sampler_apply(chain, &cur_p);
+        return cur_p.data[cur_p.selected].id;
+    }
+
+    // determine which grammar applies: main (tool) grammar, pre-trigger grammar, or none
+    const bool use_main_grammar = grammar_should_apply(gsmpl);
+    const bool use_pre_grammar  = !use_main_grammar && pre_grammar_should_apply(gsmpl);
+    auto * active_grmr = use_main_grammar ? grmr : (use_pre_grammar ? gsmpl->pre_grmr : nullptr);
+
+    if (grammar_first && active_grmr) {
+        llama_sampler_apply(active_grmr, &cur_p);
     }
 
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
 
-    if (grammar_first || !grammar_should_apply(gsmpl)) {
+    if (grammar_first || !active_grmr) {
         return id;
     }
 
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
+    // check if the sampled token fits the active grammar (grammar-based rejection sampling)
     {
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
 
-        llama_sampler_apply(grmr, &single_token_data_array);
+        llama_sampler_apply(active_grmr, &single_token_data_array);
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
@@ -594,8 +653,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     llama_sampler_apply(rbudget,  &cur_p);
 
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
+    if (active_grmr) {
+        llama_sampler_apply(active_grmr,  &cur_p);
     }
 
     llama_sampler_apply(chain, &cur_p);
